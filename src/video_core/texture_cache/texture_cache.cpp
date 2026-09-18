@@ -280,15 +280,21 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                 stencil_tiling_info, stencil_linear_download,
                 stencil_tiled_download, stencil_padded_tiled_size);
 
-            static bool cpu_tiling_logged = false;
-            if (!cpu_tiling_logged) {
-                cpu_tiling_logged = true;
-                LOG_WARNING(
+            const u64 expected_retiled =
+                static_cast<u64>(stencil_tiling_info.mips_layout[0].pitch) *
+                stencil_tiling_info.size.height;
+
+            // A supported CPU layout should always map every visible element
+            // into the padded tiled span. If that invariant ever fails, use
+            // the existing GPU tiler instead of exposing partial guest data.
+            if (result.out_of_range != 0 || result.retiled != expected_retiled) {
+                LOG_ERROR(
                     Render_Vulkan,
-                    "[GPUADDR-CPU-TILE] retiled={} padded_tail={} out_of_range={} "
+                    "[GPUADDR-CPU-TILE-FAIL] retiled={} expected={} out_of_range={} "
                     "tile_mode={} array_mode={} pitch={} visible_h={} padded_h={} "
-                    "bank_swizzle={:#x} padded_size={:#x} first_bad=({}, {})@{:#x}",
-                    result.retiled, result.padded_tail, result.out_of_range,
+                    "bank_swizzle={:#x} padded_size={:#x} first_bad=({}, {})@{:#x}; "
+                    "falling back to GPU TileBuffer",
+                    result.retiled, expected_retiled, result.out_of_range,
                     static_cast<u32>(stencil_tiling_info.tile_mode),
                     static_cast<u32>(stencil_tiling_info.array_mode),
                     stencil_tiling_info.mips_layout[0].pitch,
@@ -298,9 +304,15 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                     stencil_padded_tiled_size,
                     result.first_bad_x, result.first_bad_y,
                     result.first_bad_offset);
+
+                tile_manager.TileBuffer(
+                    stencil_tiling_info, download_buffer.Handle(),
+                    static_cast<u32>(stencil_offset),
+                    download_buffer.Handle(),
+                    static_cast<u32>(stencil_tiled_offset));
+                scheduler.Finish();
             }
         }
-
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download, download_size);
 
