@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/preprocessor/stringize.hpp>
+#include <cstring>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -241,10 +242,35 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         default:
             UNREACHABLE_MSG("Wrong PM4 type {}", type);
             break;
-        case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
+        case 0: {
+            // Type-0 packets perform sequential MMIO register writes.
+            const u32 reg_addr = header->type0.base.Value();
+            const u32 num_words = header->type0.NumWords();
+            const size_t packet_dwords = static_cast<size_t>(num_words) + 1;
+
+            if (packet_dwords > dcb.size()) {
+                LOG_ERROR(Lib_GnmDriver,
+                          "Truncated PM4 Type-0 packet: base={:#x}, words={}, remaining={}",
+                          reg_addr, num_words, dcb.size());
+                dcb = {};
+                continue;
+            }
+
+            const auto* payload = reinterpret_cast<const u32*>(header + 1);
+            if (reg_addr < Regs::NumRegs && num_words <= (Regs::NumRegs - reg_addr)) {
+                std::memcpy(&regs.reg_array[reg_addr], payload,
+                            static_cast<size_t>(num_words) * sizeof(u32));
+            } else {
+                // Keep the PM4 stream synchronized even for registers that are not
+                // represented by the current Regs model.
+                LOG_WARNING(Lib_GnmDriver,
+                            "PM4 Type-0 register range outside Regs: base={:#x}, words={}",
+                            reg_addr, num_words);
+            }
+
+            dcb = NextPacket(dcb, packet_dwords);
+            continue;
+        }
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -848,7 +874,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                                 static_cast<u32>(opcode), count);
             }
-            dcb = NextPacket(dcb, header->type3.NumWords() + 1);
+            // Use the packet length captured before dispatch. Guest/ring command
+            // memory can be rewritten while a packet is being processed; re-reading
+            // the live header here can desynchronize the PM4 stream.
+            dcb = NextPacket(dcb, static_cast<size_t>(count) + 1);
             break;
         }
     }
