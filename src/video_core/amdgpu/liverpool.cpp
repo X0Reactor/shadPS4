@@ -216,8 +216,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                                           std::shared_ptr<GfxCmdStorage> owned_cmds) {
     FIBER_ENTER(dcb_task_name);
+
+    // Keep per-submission command storage alive for the coroutine lifetime.
+    (void)owned_cmds;
 
     cblock.Reset();
 
@@ -1194,11 +1198,21 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
+    std::shared_ptr<GfxCmdStorage> owned_cmds;
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
+    } else {
+        // Top-level GFX processing is asynchronous, so guest command memory can
+        // be recycled before the queued coroutine finishes consuming it.
+        // Keep an immutable per-submission copy alive with the coroutine.
+        owned_cmds = std::make_shared<GfxCmdStorage>();
+        owned_cmds->dcb.assign(dcb.begin(), dcb.end());
+        owned_cmds->ccb.assign(ccb.begin(), ccb.end());
+        dcb = owned_cmds->dcb;
+        ccb = owned_cmds->ccb;
     }
 
-    auto task = ProcessGraphics(dcb, ccb);
+    auto task = ProcessGraphics(dcb, ccb, std::move(owned_cmds));
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);

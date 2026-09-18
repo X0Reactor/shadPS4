@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -176,9 +177,15 @@ private:
         Handle handle;
     };
 
+    struct GfxCmdStorage {
+        std::vector<u32> dcb;
+        std::vector<u32> ccb;
+    };
+
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                         std::shared_ptr<GfxCmdStorage> owned_cmds = {});
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
