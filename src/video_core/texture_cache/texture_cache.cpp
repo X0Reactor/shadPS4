@@ -162,15 +162,19 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     // target may expose its separate S8 allocation in the same tiled layout as
     // the depth target. In that case the guest CPU must receive tiled bytes,
     // not the raw row-major Vulkan copy.
+    u8* stencil_linear_download = nullptr;
     u8* stencil_tiled_download = nullptr;
+    u32 stencil_padded_tiled_size = 0;
     u64 stencil_tiled_offset = 0;
     bool retile_separate_stencil = false;
+    bool use_sony_cpu_stencil_retile = false;
     ImageInfo stencil_tiling_info{};
 
     if (download_separate_stencil) {
         const auto [mapped_stencil, mapped_offset] =
             download_buffer.Map(image.info.stencil_size);
         stencil_download = mapped_stencil;
+        stencil_linear_download = mapped_stencil;
         stencil_offset = mapped_offset;
         download_buffer.Commit();
 
@@ -191,7 +195,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
             stencil_tiling_info.guest_size = 0;
             stencil_tiling_info.UpdateSize();
 
-            const u32 stencil_padded_tiled_size =
+            stencil_padded_tiled_size =
                 stencil_tiling_info.guest_size;
             const bool valid_stencil_tiling_layout =
                 stencil_padded_tiled_size >= image.info.stencil_size &&
@@ -216,6 +220,20 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                 stencil_tiled_offset = mapped_tiled_offset;
                 download_buffer.Commit();
                 retile_separate_stencil = true;
+
+                // Use the CPU Sony-GpuAddress path only for the exact layout
+                // family already proven byte-for-byte against TileManager.
+                // Other layouts retain the existing GPU fallback.
+                use_sony_cpu_stencil_retile =
+                    stencil_tiling_info.num_bits == 8 &&
+                    stencil_tiling_info.num_samples == 1 &&
+                    static_cast<u32>(stencil_tiling_info.tile_mode) == 0 &&
+                    static_cast<u32>(stencil_tiling_info.array_mode) == 4 &&
+                    static_cast<u32>(stencil_tiling_info.bank_swizzle) == 0 &&
+                    stencil_tiling_info.mips_layout[0].pitch != 0 &&
+                    (stencil_tiling_info.mips_layout[0].pitch % 256) == 0 &&
+                    stencil_tiling_info.mips_layout[0].height != 0 &&
+                    (stencil_tiling_info.mips_layout[0].height % 128) == 0;
 
             }
         }
@@ -249,19 +267,185 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                                  download_buffer.Handle(), stencil_download_copy);
     }
 
-    if (retile_separate_stencil) {
-        tile_manager.TileBuffer(stencil_tiling_info, download_buffer.Handle(),
-                                static_cast<u32>(stencil_offset), download_buffer.Handle(),
-                                static_cast<u32>(stencil_tiled_offset));
+        if (retile_separate_stencil) {
+            // Metal Max Xeno's CPU-read fault path is synchronous. For the exact
+            // validated S8 layout, let the recovered Sony GpuAddress math produce
+            // the tiled bytes after scheduler.Finish(). Preserve TileManager as
+            // the generic fallback and for asynchronous downloads.
+            if (!use_sony_cpu_stencil_retile || !sync) {
+                tile_manager.TileBuffer(stencil_tiling_info, download_buffer.Handle(),
+                                        static_cast<u32>(stencil_offset),
+                                        download_buffer.Handle(),
+                                        static_cast<u32>(stencil_tiled_offset));
+            }
 
-        // Use guest-layout bytes for the CPU writeback below.
-        stencil_download = stencil_tiled_download;
-
-    }
+            stencil_download = stencil_tiled_download;
+        }
 
     if (sync) {
         scheduler.Finish();
+        // MMX-SONY-GPUADDR-CPU-V2
+        //
+        // Authoritative CPU retile for the exact Sony/PS4 S8 layout validated
+        // against TileManager in v1. Unsupported and asynchronous layouts keep
+        // the existing GPU TileManager fallback above.
+        if (use_sony_cpu_stencil_retile) {
+            const auto& mip = stencil_tiling_info.mips_layout[0];
 
+            constexpr u32 kMicroTileWidth = 8;
+            constexpr u32 kMicroTileHeight = 8;
+            constexpr u32 kNumPipes = 8;
+            constexpr u32 kNumBanks = 16;
+            constexpr u32 kBankWidth = 1;
+            constexpr u32 kBankHeight = 4;
+            constexpr u32 kMacroTileAspect = 4;
+            constexpr u32 kPipeInterleaveBytes = 256;
+            constexpr u32 kPipeInterleaveBits = 8;
+            constexpr u32 kPipeBits = 3;
+            constexpr u32 kBankBits = 4;
+            constexpr u32 kTileBytes = 64;
+            constexpr u32 kMacroTileWidth =
+                (kMicroTileWidth * kBankWidth * kNumPipes) * kMacroTileAspect;
+            constexpr u32 kMacroTileHeight =
+                (kMicroTileHeight * kBankHeight * kNumBanks) / kMacroTileAspect;
+            constexpr u32 kMacroTileBytes =
+                (kMacroTileWidth / kMicroTileWidth) *
+                (kMacroTileHeight / kMicroTileHeight) *
+                kTileBytes / (kNumPipes * kNumBanks);
+
+            const auto element_index = [](u32 x, u32 y) -> u32 {
+                // Sony GpuAddress getElementIndex(), depth/thin microtile:
+                // x0,y0,x1,y1,x2,y2.
+                return (((x >> 0) & 1U) << 0) |
+                       (((y >> 0) & 1U) << 1) |
+                       (((x >> 1) & 1U) << 2) |
+                       (((y >> 1) & 1U) << 3) |
+                       (((x >> 2) & 1U) << 4) |
+                       (((y >> 2) & 1U) << 5);
+            };
+
+            const auto pipe_index = [](u32 x, u32 y) -> u32 {
+                // Sony pipe config 0x0C: P8_32x32_16x16.
+                return ((((x >> 3) ^ (y >> 3) ^ (x >> 4)) & 1U) << 0) |
+                       ((((x >> 4) ^ (y >> 4)) & 1U) << 1) |
+                       ((((x >> 5) ^ (y >> 5)) & 1U) << 2);
+            };
+
+            const auto bank_index = [](u32 x, u32 y) -> u32 {
+                // bankWidth=1, bankHeight=4, numPipes=8, numBanks=16.
+                const u32 xs = x >> 3;
+                const u32 ys = y >> 2;
+
+                return ((((xs >> 3) ^ (ys >> 6)) & 1U) << 0) |
+                       ((((xs >> 4) ^ (ys >> 5) ^ (ys >> 6)) & 1U) << 1) |
+                       ((((xs >> 5) ^ (ys >> 4)) & 1U) << 2) |
+                       ((((xs >> 6) ^ (ys >> 3)) & 1U) << 3);
+            };
+
+            const auto tiled_byte_offset = [&](u32 x, u32 y) -> u64 {
+                // S8, 1x, thin: tileBytes == tileSplitBytes == 64.
+                // z=0 and fragmentIndex=0, matching the game's native sampler.
+                const u64 elem = element_index(x, y);
+                const u64 pipe = pipe_index(x, y);
+
+                // v2 is enabled only when bank_swizzle==0. Keep the operation
+                // here so the source mirrors Sony's address-construction order.
+                u64 bank = bank_index(x, y);
+                bank ^= static_cast<u64>(stencil_tiling_info.bank_swizzle);
+                bank &= (kNumBanks - 1);
+
+                const u64 macro_tiles_per_row =
+                    static_cast<u64>(mip.pitch) / kMacroTileWidth;
+                const u64 macro_tile_row_index = y / kMacroTileHeight;
+                const u64 macro_tile_column_index = x / kMacroTileWidth;
+                const u64 macro_tile_index =
+                    macro_tile_row_index * macro_tiles_per_row +
+                    macro_tile_column_index;
+                const u64 macro_tile_offset =
+                    macro_tile_index * kMacroTileBytes;
+
+                const u64 tile_row_index =
+                    (y / kMicroTileHeight) % kBankHeight;
+                const u64 tile_column_index =
+                    ((x / kMicroTileWidth) / kNumPipes) % kBankWidth;
+                const u64 tile_index =
+                    tile_row_index * kBankWidth + tile_column_index;
+                const u64 tile_offset = tile_index * kTileBytes;
+
+                const u64 total_byte_offset =
+                    macro_tile_offset + tile_offset + elem;
+
+                const u64 pipe_interleave_offset =
+                    total_byte_offset & (kPipeInterleaveBytes - 1);
+                const u64 offset =
+                    total_byte_offset >> kPipeInterleaveBits;
+
+                return pipe_interleave_offset |
+                       (pipe << kPipeInterleaveBits) |
+                       (bank << (kPipeInterleaveBits + kPipeBits)) |
+                       (offset << (kPipeInterleaveBits +
+                                  kPipeBits + kBankBits));
+            };
+
+            u64 retiled = 0;
+            u64 padded_tail = 0;
+            u64 out_of_range = 0;
+            u32 first_bad_x = 0;
+            u32 first_bad_y = 0;
+            u64 first_bad_offset = 0;
+            bool have_bad = false;
+
+            for (u32 y = 0; y < image.info.size.height; ++y) {
+                for (u32 x = 0; x < mip.pitch; ++x) {
+                    const u64 linear_offset =
+                        static_cast<u64>(y) * mip.pitch + x;
+                    const u64 tiled_offset =
+                        tiled_byte_offset(x, y);
+
+                    if (tiled_offset >= stencil_padded_tiled_size) {
+                        ++out_of_range;
+                        if (!have_bad) {
+                            have_bad = true;
+                            first_bad_x = x;
+                            first_bad_y = y;
+                            first_bad_offset = tiled_offset;
+                        }
+                        continue;
+                    }
+
+                    // Some visible coordinates naturally land in the padded
+                    // tail above the guest-visible prefix. This is expected and
+                    // exactly matches the validated TileManager layout.
+                    if (tiled_offset >= image.info.stencil_size) {
+                        ++padded_tail;
+                    }
+
+                    stencil_tiled_download[tiled_offset] =
+                        stencil_linear_download[linear_offset];
+                    ++retiled;
+                }
+            }
+
+            static bool sony_gpuaddr_cpu_logged = false;
+            if (!sony_gpuaddr_cpu_logged) {
+                sony_gpuaddr_cpu_logged = true;
+
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "[MMX-SONY-GPUADDR-CPU-V2] "
+                    "retiled={} padded_tail={} out_of_range={} "
+                    "tile_mode={} array_mode={} pitch={} visible_h={} "
+                    "padded_h={} bank_swizzle={:#x} padded_size={:#x} "
+                    "first_bad=({}, {})@{:#x}",
+                    retiled, padded_tail, out_of_range,
+                    static_cast<u32>(stencil_tiling_info.tile_mode),
+                    static_cast<u32>(stencil_tiling_info.array_mode),
+                    mip.pitch, image.info.size.height, mip.height,
+                    static_cast<u32>(stencil_tiling_info.bank_swizzle),
+                    stencil_padded_tiled_size,
+                    first_bad_x, first_bad_y, first_bad_offset);
+            }
+        }
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download, download_size);
 
