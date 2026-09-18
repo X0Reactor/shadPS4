@@ -24,6 +24,12 @@ public:
                          StreamBuffer& stream_buffer);
     ~TileManager();
 
+    /// Converts a linear buffer region into the guest tiled layout described by info.
+    /// Both buffers must support storage-buffer access. Input and output may be
+    /// non-overlapping regions of the same Vulkan buffer.
+    void TileBuffer(const ImageInfo& info, vk::Buffer linear_buffer, u32 linear_offset,
+                    vk::Buffer tiled_buffer, u32 tiled_offset);
+
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                    vk::Buffer out_buffer, u32 out_offset, u32 copy_size);
 

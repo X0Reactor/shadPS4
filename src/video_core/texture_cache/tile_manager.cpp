@@ -241,6 +241,141 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     return {out_buffer, 0};
 }
 
+void TileManager::TileBuffer(const ImageInfo& info, vk::Buffer linear_buffer, u32 linear_offset,
+                             vk::Buffer tiled_buffer, u32 tiled_offset) {
+    ASSERT(info.props.is_tiled);
+    ASSERT(info.num_bits >= 8);
+    ASSERT(info.resources.levels > 0);
+
+    TilingInfo params{};
+    params.bank_swizzle = info.bank_swizzle;
+    params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
+    params.num_mips = info.resources.levels;
+
+    u32 tiled_span_size = 0;
+    for (u32 mip = 0; mip < params.num_mips; ++mip) {
+        auto& mip_info = params.mips[mip];
+        mip_info = info.mips_layout[mip];
+
+        // Preserve the full padded tiled span from UpdateSize()/ImageInfo.
+        // info.guest_size may intentionally be smaller and represents the real
+        // guest-visible byte count that should be dispatched/written back.
+        tiled_span_size =
+            std::max(tiled_span_size, mip_info.offset + mip_info.size);
+
+        if (info.props.is_block) {
+            mip_info.pitch = std::max((mip_info.pitch + 3) / 4, 1U);
+            mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
+        }
+    }
+    tiled_span_size = std::max(tiled_span_size, info.guest_size);
+
+    const vk::DescriptorBufferInfo params_buffer_info{
+        .buffer = stream_buffer.Handle(),
+        .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
+        .range = sizeof(params),
+    };
+
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+
+    // Vulkan copy -> linear staging must be visible to the tiling compute shader.
+    // The tiled output uses its full padded footprint even when only a smaller
+    // guest-visible prefix is copied back afterward.
+    const std::array<vk::BufferMemoryBarrier2, 2> pre_barriers = {{
+        {
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .buffer = linear_buffer,
+            .offset = linear_offset,
+            .size = info.guest_size,
+        },
+        {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask =
+                vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .buffer = tiled_buffer,
+            .offset = tiled_offset,
+            .size = tiled_span_size,
+        },
+    }};
+
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = static_cast<u32>(pre_barriers.size()),
+        .pBufferMemoryBarriers = pre_barriers.data(),
+    });
+
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
+
+    const vk::DescriptorBufferInfo tiled_buffer_info{
+        .buffer = tiled_buffer,
+        .offset = tiled_offset,
+        .range = tiled_span_size,
+    };
+    const vk::DescriptorBufferInfo linear_buffer_info{
+        .buffer = linear_buffer,
+        .offset = linear_offset,
+        .range = info.guest_size,
+    };
+
+    const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &tiled_buffer_info,
+        },
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &linear_buffer_info,
+        },
+        {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 2,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eUniformBuffer,
+            .pBufferInfo = &params_buffer_info,
+        },
+    }};
+
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+
+    const u32 bytes_per_element = info.num_bits / 8;
+    const u32 num_elements = info.guest_size / bytes_per_element;
+    ASSERT(num_elements % 64 == 0);
+    cmdbuf.dispatch(num_elements / 64, 1, 1);
+
+    const vk::BufferMemoryBarrier2 post_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        .buffer = tiled_buffer,
+        .offset = tiled_offset,
+        .size = tiled_span_size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &post_barrier,
+    });
+}
+// Generic helper above is used by TextureCache for separate 8-bit stencil
+// readback. No title-specific address, coordinate, stencil value or decision
+// is encoded here.
+
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                             vk::Buffer out_buffer, u32 out_offset, u32 copy_size) {
     const auto& info = in_image.info;

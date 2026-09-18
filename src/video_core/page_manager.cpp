@@ -41,10 +41,10 @@ constexpr size_t PM_PAGE_BITS = 12;
 
 struct PageManager::Impl {
     struct PageState {
-        u8 num_write_watchers : 7;
-        // At the moment only buffer cache can request read watchers.
-        // And buffers cannot overlap, thus only 1 can exist per page.
-        u8 num_read_watchers : 1;
+        // Keep PageState compact while allowing a TextureCache read watcher to
+        // coexist with BufferCache precise-readback watchers on the same page.
+        u8 num_write_watchers : 6;
+        u8 num_read_watchers : 2;
 
         Core::MemoryPermission WritePerm() const noexcept {
             return num_write_watchers == 0 ? Core::MemoryPermission::Write
@@ -57,6 +57,12 @@ struct PageManager::Impl {
         }
 
         Core::MemoryPermission Perms() const noexcept {
+            // Windows cannot represent write-only guest pages. A read watcher
+            // therefore protects the page as no-access; writes will fault too
+            // and take the normal invalidation path.
+            if (num_read_watchers != 0) {
+                return Core::MemoryPermission::None;
+            }
             return ReadPerm() | WritePerm();
         }
 
@@ -64,6 +70,7 @@ struct PageManager::Impl {
         u8 AddDelta() {
             if constexpr (is_read) {
                 if constexpr (delta == 1) {
+                    ASSERT_MSG(num_read_watchers < 3, "Too many read watchers on one page");
                     return ++num_read_watchers;
                 } else if (delta == -1) {
                     ASSERT_MSG(num_read_watchers > 0, "Not enough watchers");
@@ -377,9 +384,9 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
 }
 
-template <bool track>
+template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
-    impl->UpdatePageWatchers<track, false>(addr, size);
+    impl->UpdatePageWatchers<track, is_read>(addr, size);
 }
 
 template <bool track, bool is_read>
@@ -387,8 +394,10 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask)
     impl->UpdatePageWatchersForRegion<track, is_read>(base_addr, mask);
 }
 
-template void PageManager::UpdatePageWatchers<true>(VAddr addr, u64 size) const;
-template void PageManager::UpdatePageWatchers<false>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<true, false>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<false, false>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<true, true>(VAddr addr, u64 size) const;
+template void PageManager::UpdatePageWatchers<false, true>(VAddr addr, u64 size) const;
 template void PageManager::UpdatePageWatchersForRegion<true, true>(VAddr base_addr,
                                                                    RegionBits& mask) const;
 template void PageManager::UpdatePageWatchersForRegion<true, false>(VAddr base_addr,

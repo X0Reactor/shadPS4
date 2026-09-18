@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <mutex>
+
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -248,7 +251,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!FilterDraw()) {
         return;
     }
-
     const DrawIndirectParams params = {
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
@@ -1102,6 +1104,18 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+
+    // Separate stencil allocations live in TextureCache rather than BufferCache.
+    // Give TextureCache first chance to satisfy a read fault with the current
+    // Vulkan stencil contents. If another BufferCache read watcher overlaps the
+    // page, the retried CPU access will fault again and BufferCache handles it.
+    if (texture_cache.ReadMemory(addr, size)) {
+        // MMX current sampler phase: the 96-entry producer-history experiment
+        // is complete. Keep its code resident, but silence per-read dumps so
+        // the target-mask consumer summaries are not lost to the log cap.
+        return true;
+    }
+
     buffer_cache.ReadMemory(addr, size);
     return true;
 }
