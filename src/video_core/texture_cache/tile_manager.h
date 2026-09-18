@@ -30,6 +30,25 @@ public:
     void TileBuffer(const ImageInfo& info, vk::Buffer linear_buffer, u32 linear_offset,
                     vk::Buffer tiled_buffer, u32 tiled_offset);
 
+    struct CpuTilingResult {
+        u64 retiled{};
+        u64 padded_tail{};
+        u64 out_of_range{};
+        u32 first_bad_x{};
+        u32 first_bad_y{};
+        u64 first_bad_offset{};
+    };
+
+    /// Returns true when the current CPU address implementation can reproduce
+    /// the guest tiled layout represented by info.
+    [[nodiscard]] static bool CanTileBufferCpu(const ImageInfo& info);
+
+    /// Converts a linear host buffer into PS4 guest tiled layout using CPU-side
+    /// GCN/GpuAddress equations. The caller supplies the full padded tiled span.
+    [[nodiscard]] static CpuTilingResult TileBufferCpu(const ImageInfo& info,
+                                                       const u8* linear, u8* tiled,
+                                                       u32 tiled_span_size);
+
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                    vk::Buffer out_buffer, u32 out_offset, u32 copy_size);
 
