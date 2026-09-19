@@ -96,6 +96,11 @@ public:
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 
+    /// Handles a CPU read fault for a GPU-backed separate stencil allocation.
+    /// Returns true if TextureCache synchronized the faulting range.
+    bool ReadMemory(VAddr addr, u64 size);
+
+
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
@@ -281,6 +286,10 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
 
+    /// Arms/disarms CPU read faults for a separate guest stencil allocation.
+    void ArmStencilReadWatcher(ImageId stencil_id);
+    void DisarmStencilReadWatcher(ImageId stencil_id);
+
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
 
@@ -332,6 +341,7 @@ private:
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
+    std::unordered_set<ImageId> stencil_read_watchers;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;

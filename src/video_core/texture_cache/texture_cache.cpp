@@ -9,6 +9,7 @@
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -67,18 +68,66 @@ void TextureCache::ProcessDownloadImages() {
     }
     download_images.clear();
 }
+bool TextureCache::ReadMemory(VAddr addr, u64 size) {
+    bool handled = false;
 
+    liverpool->SendCommand<true>([this, addr, size, &handled] {
+        std::scoped_lock lock{mutex};
+
+        ImageId stencil_id{};
+        ImageId depth_id{};
+
+        ForEachImageInRegion(addr, size, [&](ImageId candidate_id, Image& stencil_image) -> bool {
+            if (!stencil_read_watchers.contains(candidate_id)) {
+                return false;
+            }
+
+            const ImageId candidate_depth = GetAssociatedDepth(stencil_image);
+            if (!candidate_depth) {
+                // The depth image vanished while this placeholder remained.
+                DisarmStencilReadWatcher(candidate_id);
+                return false;
+            }
+
+            stencil_id = candidate_id;
+            depth_id = candidate_depth;
+            return true;
+        });
+
+        if (!stencil_id || !depth_id) {
+            return;
+        }
+
+        Image& stencil_image = slot_images[stencil_id];
+        Image& depth_image = slot_images[depth_id];
+
+        // Release only the read watcher before writing the freshly downloaded
+        // bytes. The ordinary TextureCache write watcher remains armed.
+        DisarmStencilReadWatcher(stencil_id);
+
+
+        // Download the associated depth/stencil image and copy the Vulkan
+        // stencil aspect back to its separate guest allocation.
+        DownloadImageMemory(depth_id, true);
+        handled = true;
+    });
+
+    return handled;
+}
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+
     auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
+
     const auto [download, offset] = download_buffer.Map(download_size);
     download_buffer.Commit();
+
     const vk::BufferImageCopy image_download = {
         .bufferOffset = offset,
         .bufferRowLength = image.info.pitch,
@@ -94,21 +143,196 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         .imageOffset = {0, 0, 0},
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
+
+    // Generic separate-stencil readback.
+    // A PS4 depth target can keep stencil in a separate guest allocation even
+    // though Vulkan represents depth+stencil as aspects of the same host image.
+    const u32 minimum_stencil_size = image.info.pitch * image.info.size.height;
+    const bool host_has_stencil =
+        bool(image.aspect_mask & vk::ImageAspectFlagBits::eStencil);
+    const bool download_separate_stencil =
+        readback_linear_images && image.info.props.is_depth && image.info.props.has_stencil &&
+        host_has_stencil && image.info.stencil_addr != 0 && image.info.stencil_size != 0 &&
+        image.info.stencil_size >= minimum_stencil_size && image.info.num_samples == 1 &&
+        image.info.size.depth == 1 && image.info.resources.layers == 1;
+
+    u8* stencil_download = nullptr;
+    u64 stencil_offset = 0;
+    // copyImageToBuffer always gives us a linear stencil stream. A PS4 depth
+    // target may expose its separate S8 allocation in the same tiled layout as
+    // the depth target. In that case the guest CPU must receive tiled bytes,
+    // not the raw row-major Vulkan copy.
+    u8* stencil_linear_download = nullptr;
+    u8* stencil_tiled_download = nullptr;
+    u32 stencil_padded_tiled_size = 0;
+    u64 stencil_tiled_offset = 0;
+    bool retile_separate_stencil = false;
+    bool use_cpu_stencil_retile = false;
+    ImageInfo stencil_tiling_info{};
+
+    if (download_separate_stencil) {
+        const auto [mapped_stencil, mapped_offset] =
+            download_buffer.Map(image.info.stencil_size);
+        stencil_download = mapped_stencil;
+        stencil_linear_download = mapped_stencil;
+        stencil_offset = mapped_offset;
+        download_buffer.Commit();
+
+        if (image.info.props.is_tiled) {
+            stencil_tiling_info = image.info;
+
+            // DB_Z_INFO supplies the tile mode used by the paired depth/stencil
+            // target. Stencil itself is S8, so retain geometry/tile mode while
+            // rebuilding layout metadata at 8 bits per element.
+            stencil_tiling_info.num_bits = 8;
+            stencil_tiling_info.num_samples = 1;
+            stencil_tiling_info.props.is_block = false;
+            stencil_tiling_info.props.is_volume = false;
+            stencil_tiling_info.resources.levels = 1;
+            stencil_tiling_info.resources.layers = 1;
+            stencil_tiling_info.size.depth = 1;
+            stencil_tiling_info.guest_address = image.info.stencil_addr;
+            stencil_tiling_info.guest_size = 0;
+            stencil_tiling_info.UpdateSize();
+
+            stencil_padded_tiled_size =
+                stencil_tiling_info.guest_size;
+            const bool valid_stencil_tiling_layout =
+                stencil_padded_tiled_size >= image.info.stencil_size &&
+                stencil_tiling_info.mips_layout[0].pitch >= image.info.pitch &&
+                stencil_tiling_info.mips_layout[0].height >= image.info.size.height;
+
+            if (valid_stencil_tiling_layout) {
+                // The depth ImageInfo's generic macro-tile size rounds this
+                // 2048x1080 S8 surface to a padded footprint (0x240000 here),
+                // while the separate stencil allocation is intentionally
+                // pitch * visible-height bytes (0x21C000 here).
+                //
+                // Preserve mips_layout[] from UpdateSize() for tile addressing,
+                // but make guest_size the real logical/guest byte count. The
+                // v1.2 TileBuffer uses mips_layout[] for its padded output span
+                // and guest_size only for the input range and dispatch count.
+                stencil_tiling_info.guest_size = image.info.stencil_size;
+
+                const auto [mapped_tiled, mapped_tiled_offset] =
+                    download_buffer.Map(stencil_padded_tiled_size);
+                stencil_tiled_download = mapped_tiled;
+                stencil_tiled_offset = mapped_tiled_offset;
+                download_buffer.Commit();
+                retile_separate_stencil = true;
+
+                // Use the CPU GpuAddress path only for the exact layout
+                // family already proven byte-for-byte against TileManager.
+                // Other layouts retain the existing GPU fallback.
+                use_cpu_stencil_retile = TileManager::CanTileBufferCpu(stencil_tiling_info);
+
+            }
+        }
+    }
+
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
+
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              download_buffer.Handle(), image_download);
 
+    if (download_separate_stencil) {
+        const vk::BufferImageCopy stencil_download_copy = {
+            .bufferOffset = stencil_offset,
+            .bufferRowLength = image.info.pitch,
+            .bufferImageHeight = image.info.size.height,
+            .imageSubresource =
+                {
+                    .aspectMask = vk::ImageAspectFlagBits::eStencil,
+                    .mipLevel = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {image.info.size.width, image.info.size.height, 1},
+        };
+
+        // Read back a separate stencil allocation into guest-visible memory.
+        cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                                 download_buffer.Handle(), stencil_download_copy);
+    }
+
+        if (retile_separate_stencil) {
+            // Supported CPU-read synchronization uses this path for the exact
+            // validated S8 layout, let the CPU GpuAddress math produce
+            // the tiled bytes after scheduler.Finish(). Preserve TileManager as
+            // the generic fallback and for asynchronous downloads.
+            if (!use_cpu_stencil_retile || !sync) {
+                tile_manager.TileBuffer(stencil_tiling_info, download_buffer.Handle(),
+                                        static_cast<u32>(stencil_offset),
+                                        download_buffer.Handle(),
+                                        static_cast<u32>(stencil_tiled_offset));
+            }
+
+            stencil_download = stencil_tiled_download;
+        }
+
     if (sync) {
         scheduler.Finish();
+        if (use_cpu_stencil_retile) {
+            const auto result = TileManager::TileBufferCpu(
+                stencil_tiling_info, stencil_linear_download,
+                stencil_tiled_download, stencil_padded_tiled_size);
+
+            const u64 expected_retiled =
+                static_cast<u64>(stencil_tiling_info.mips_layout[0].pitch) *
+                stencil_tiling_info.size.height;
+
+            // A supported CPU layout should always map every visible element
+            // into the padded tiled span. If that invariant ever fails, use
+            // the existing GPU tiler instead of exposing partial guest data.
+            if (result.out_of_range != 0 || result.retiled != expected_retiled) {
+                LOG_ERROR(
+                    Render_Vulkan,
+                    "[GPUADDR-CPU-TILE-FAIL] retiled={} expected={} out_of_range={} "
+                    "tile_mode={} array_mode={} pitch={} visible_h={} padded_h={} "
+                    "bank_swizzle={:#x} padded_size={:#x} first_bad=({}, {})@{:#x}; "
+                    "falling back to GPU TileBuffer",
+                    result.retiled, expected_retiled, result.out_of_range,
+                    static_cast<u32>(stencil_tiling_info.tile_mode),
+                    static_cast<u32>(stencil_tiling_info.array_mode),
+                    stencil_tiling_info.mips_layout[0].pitch,
+                    stencil_tiling_info.size.height,
+                    stencil_tiling_info.mips_layout[0].height,
+                    static_cast<u32>(stencil_tiling_info.bank_swizzle),
+                    stencil_padded_tiled_size,
+                    result.first_bad_x, result.first_bad_y,
+                    result.first_bad_offset);
+
+                tile_manager.TileBuffer(
+                    stencil_tiling_info, download_buffer.Handle(),
+                    static_cast<u32>(stencil_offset),
+                    download_buffer.Handle(),
+                    static_cast<u32>(stencil_tiled_offset));
+                scheduler.Finish();
+            }
+        }
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download, download_size);
+
+        if (download_separate_stencil) {
+            Core::Memory::Instance()->TryWriteBacking(
+                std::bit_cast<u8*>(image.info.stencil_addr), stencil_download,
+                image.info.stencil_size);
+        }
     } else {
         scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
-                                                          download_size);
+            [this, device_addr = image.info.guest_address, download, download_size,
+             download_separate_stencil, stencil_addr = image.info.stencil_addr,
+             stencil_download, stencil_size = image.info.stencil_size] {
+                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                          download, download_size);
+
+                if (download_separate_stencil) {
+                    Core::Memory::Instance()->TryWriteBacking(
+                        std::bit_cast<u8*>(stencil_addr), stencil_download, stencil_size);
+                }
             });
     }
 }
@@ -128,6 +352,11 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
+        // A read watcher protects the whole host page. A CPU write anywhere on
+        // that protected page must release the TextureCache read watcher so the
+        // faulting instruction can be retried through the normal invalidation path.
+        DisarmStencilReadWatcher(image_id);
+
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
         if (image.Overlaps(addr, size)) {
@@ -703,7 +932,20 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         Image& stencil_image = slot_images[stencil_id];
         TouchImage(stencil_image);
         stencil_image.AssociateDepth(image_id, image.image_uid);
+
+        const u32 minimum_stencil_size = image.info.pitch * image.info.size.height;
+        const bool valid_separate_stencil =
+            readback_linear_images && image.info.props.is_depth && image.info.props.has_stencil &&
+            bool(image.aspect_mask & vk::ImageAspectFlagBits::eStencil) &&
+            image.info.stencil_addr != 0 && image.info.stencil_size != 0 &&
+            image.info.stencil_size >= minimum_stencil_size && image.info.num_samples == 1 &&
+            image.info.size.depth == 1 && image.info.resources.layers == 1;
+
+        if (valid_separate_stencil) {
+            ArmStencilReadWatcher(stencil_id);
+        }
     }
+
 
     return image.FindView(desc.view_info, false);
 }
@@ -818,6 +1060,46 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     return it->second.Handle();
 }
 
+void TextureCache::ArmStencilReadWatcher(ImageId stencil_id) {
+    if (!readback_linear_images || !stencil_id || !slot_images.is_allocated(stencil_id)) {
+        return;
+    }
+
+    Image& stencil_image = slot_images[stencil_id];
+    if (False(stencil_image.flags & ImageFlagBits::Registered) ||
+        stencil_image.info.guest_address == 0 || stencil_image.info.guest_size == 0) {
+        return;
+    }
+
+    // The normal write watcher is required as well: Windows cannot express a
+    // write-only page when a read watcher is active.
+    TrackImage(stencil_id);
+
+    const auto [it, inserted] = stencil_read_watchers.insert(stencil_id);
+    if (!inserted) {
+        return;
+    }
+
+    tracker.UpdatePageWatchers<true, true>(stencil_image.info.guest_address,
+                                           stencil_image.info.guest_size);
+
+}
+
+void TextureCache::DisarmStencilReadWatcher(ImageId stencil_id) {
+    if (!stencil_id || !slot_images.is_allocated(stencil_id)) {
+        return;
+    }
+
+    if (stencil_read_watchers.erase(stencil_id) == 0) {
+        return;
+    }
+
+    Image& stencil_image = slot_images[stencil_id];
+    if (stencil_image.info.guest_address != 0 && stencil_image.info.guest_size != 0) {
+        tracker.UpdatePageWatchers<false, true>(stencil_image.info.guest_address,
+                                                stencil_image.info.guest_size);
+    }
+}
 void TextureCache::RegisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
@@ -830,6 +1112,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
+    DisarmStencilReadWatcher(image_id);
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
